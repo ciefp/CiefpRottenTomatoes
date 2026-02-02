@@ -24,7 +24,7 @@ from Plugins.Plugin import PluginDescriptor
 
 
 PLUGIN_NAME = "CiefpRottenTomatoes"
-PLUGIN_VERSION = "1.0"
+PLUGIN_VERSION = "1.1"
 BASE = "https://www.rottentomatoes.com"
 
 CACHE_DIR = "/tmp/CiefpRottenTomatoes"
@@ -165,17 +165,21 @@ def clear_cache():
     except:
         pass
     ensure_dirs()
-
-
 def normalize_rt_url(u):
     if not u:
         return None
+
+    u = u.strip()
+
+    # --- FIX za //www.rottentomatoes.com/...
+    if u.startswith("//"):
+        return "https:" + u
+
     if u.startswith("http"):
         return u
     if u.startswith("/"):
         return BASE + u
     return BASE + "/" + u
-
 
 # ---------- Search functions ----------
 def search_rt(query, search_type="movie"):
@@ -191,7 +195,7 @@ def search_rt(query, search_type="movie"):
         
         # Process movies
         if search_type == "movie" and "movies" in data:
-            for movie in data["movies"][:20]:  # Limit to 20 movies
+            for movie in data["movies"][:150]:
                 name = movie.get("name", "").strip()
                 year = movie.get("year", "")
                 url = movie.get("url", "")
@@ -208,7 +212,7 @@ def search_rt(query, search_type="movie"):
         
         # Process TV shows
         elif search_type == "tv" and "tvSeries" in data:
-            for tv in data["tvSeries"][:20]:  # Limit to 20 TV shows
+            for tv in data["tvSeries"][:150]: 
                 name = tv.get("name", "").strip()
                 start_year = tv.get("startYear", "")
                 url = tv.get("url", "")
@@ -315,8 +319,92 @@ def extract_jsonld_itemlist(html_text):
                     return ile
     return []
 
+def parse_editorial_guide(url):
+    raw = get_cached_page(url) or http_get(url)
+    set_cached_page(url, raw)
+    html = raw.decode("utf-8", "ignore")
+
+    out = []
+
+    # UHVATI CEO countdown-item blok:
+    # - radi i kad NEMA <br>
+    # - radi i kad ima <br>
+    # - blok ide do sledeceg row-index ili kraja dokumenta
+    item_re = re.compile(
+        r'(<div[^>]+id="row-index-[^"]*"[^>]+class=[\'"][^\'"]*countdown-item[^\'"]*[\'"][^>]*>.*?)(?=(<div[^>]+id="row-index-|$))',
+        re.I | re.S
+    )
+
+    # helper: nadji link postera / item URL
+    href_re = re.compile(
+        r'<a[^>]+class=[\'"][^\'"]*article_movie_poster[^\'"]*[\'"][^>]+href=[\'"]([^\'"]+)[\'"]',
+        re.I
+    )
+
+    # helper: title (iz h2->a) ili iz article_movie_title->a
+    title_re = re.compile(
+        r'<div[^>]+class=[\'"][^\'"]*article_movie_title[^\'"]*[\'"][^>]*>.*?<a[^>]*href=[\'"][^\'"]*[\'"][^>]*>\s*([^<]+?)\s*</a>',
+        re.I | re.S
+    )
+
+    # poster img (single ili double quotes)
+    img_re = re.compile(
+        r'<img[^>]+class=[\'"][^\'"]*article_poster[^\'"]*[\'"][^>]+src=[\'"]([^\'"]+)[\'"]',
+        re.I
+    )
+
+    # godina
+    year_re = re.compile(
+        r"<span[^>]+class=[\'\"]subtle start-year[\'\"][^>]*>\s*\((\d{4})\)\s*</span>",
+        re.I
+    )
+
+    for m in item_re.finditer(html):
+        block = m.group(1)
+
+        hm = href_re.search(block)
+        if not hm:
+            continue
+
+        href = (hm.group(1) or "").strip()
+        if not href:
+            # Disney ima template red sa href="" -> preskoci
+            continue
+
+        item_url = normalize_rt_url(href)
+
+        tm = title_re.search(block)
+        name = (tm.group(1).strip() if tm else "")
+        if not name:
+            continue
+
+        ym = year_re.search(block)
+        year = ym.group(1) if ym else ""
+
+        im = img_re.search(block)
+        img = (im.group(1).strip() if im else "")
+
+        # dodaj godinu u naziv (ako postoji)
+        if year:
+            display_name = "%s (%s)" % (name, year)
+        else:
+            display_name = name
+
+        out.append({
+            "name": display_name,
+            "url": item_url,
+            "image": img
+        })
+
+    return out
+
 
 def parse_browse(url):
+
+    # --- EDITORIAL fallback ---
+    if "editorial.rottentomatoes.com" in (url or ""):
+        return parse_editorial_guide(url)
+
     raw = get_cached_page(url) or http_get(url)
     set_cached_page(url, raw)
     html = raw.decode("utf-8", "ignore")
@@ -339,7 +427,6 @@ def parse_browse(url):
             })
 
     return out
-
 
 # ---------- Detail parser (media-scorecard-json + metadata slots) ----------
 def extract_jsonld_movie_tv(html_text):
@@ -545,7 +632,7 @@ class CiefpRTMain(Screen):
         <widget name="score_pop"  position="60,250" size="1200,40" font="Regular;30" transparent="1" foregroundColor="#00FFD84A" />
         <ePixmap position="200,350" size="1520,350" zPosition="1" backgroundColor="#80000000" />
 
-        <widget name="help" position="120,300" size="1480,500"
+        <widget name="help" position="120,120" size="1480,750"
         zPosition="2"
         font="Regular;34" transparent="1"
         foregroundColor="#FFFFFF"
@@ -627,14 +714,19 @@ class CiefpRTMain(Screen):
     def _show_startup_help(self):
         dlog("HELP: shown")
         txt = (
-            "Welcome to Ciefp Rotten Tomatoes\n\n"
+            "Welcome to Ciefp Rotten Tomatoes 1.1\n\n"
             "GREEN  = Movies\n"
             "YELLOW = Series\n"
-            "BLUE   = Settings\n\n"
+            "BLUE   = Settings\n"
+            "OK     = Cast & Crew Backdrop\n\n"
             "Tip:\n"
             "Use Settings -> Clear Cache\n"
             "to free memory if plugin becomes slow.\n\n"
-            "Press any key to continue..."
+            "Press any key to continue...\n\n"
+            "v1.2 ideas:\n"
+            "- Load more for BASE /browse/\n"
+            "- Configurable max items load\n\n"
+            "Website data provided by RottenTomatoes.com\n"
         )
         self["help"].setText(txt)
         self["help"].show()
@@ -855,7 +947,7 @@ class CiefpRTMain(Screen):
         
         cache_size = get_cache_size()
         cache_info = f" ({cache_size:.1f}MB)" if cache_size > 0 else ""
-        
+
         menu = [
             ("In theaters (Popular)", BASE + "/browse/movies_in_theaters/sort:popular"),
             ("In theaters (Newest)", BASE + "/browse/movies_in_theaters/sort:newest"),
@@ -867,6 +959,29 @@ class CiefpRTMain(Screen):
             ("In theaters (Audience lowest)", BASE + "/browse/movies_in_theaters/sort:audience_lowest"),
             ("At home", BASE + "/browse/movies_at_home/"),
             ("Coming soon", BASE + "/browse/movies_coming_soon/"),
+            ("Best New Movies", "https://editorial.rottentomatoes.com/guide/best-new-movies/"),
+            ("Best & Popular", "https://editorial.rottentomatoes.com/guide/popular-movies/"),
+            ("Best Movies 2025 (Certified Fresh)",
+             "https://editorial.rottentomatoes.com/guide/best-2025-movies-every-certified-fresh/"),
+            ("Best Movies 2024 (Certified Fresh)",
+             "https://editorial.rottentomatoes.com/guide/best-2024-movies-every-certified-fresh/"),
+            ("Best Movies 2023", "https://editorial.rottentomatoes.com/guide/best-movies-of-2023/"),
+            ("Best Movies 2022", "https://editorial.rottentomatoes.com/guide/best-movies-2022/"),
+            ("Best Movies 2021", "https://editorial.rottentomatoes.com/guide/2021-best-movies/"),
+            ("Best Movies 2020", "https://editorial.rottentomatoes.com/guide/the-best-movies-of-2020/"),
+            ("Best New Comedies of 2025", "https://editorial.rottentomatoes.com/guide/best-new-comedies-of-2025/"),
+            ("Netflix’s 100 Best Movies RIGHT NOW", "https://editorial.rottentomatoes.com/guide/best-netflix-movies-to-watch-right-now/"),
+            ("35 Steven Spielberg Movies", "https://editorial.rottentomatoes.com/guide/every-steven-spielberg-movie-ranked-by-tomatometer/"),
+            ("140 Essential Action Movies", "https://editorial.rottentomatoes.com/guide/140-essential-action-movies-to-watch-now/"),
+            ("150 Essential Sci-Fi Movies", "https://editorial.rottentomatoes.com/guide/essential-sci-fi-movies-of-all-time/"),
+            ("Best High School Movies", "https://editorial.rottentomatoes.com/guide/best-high-school-movies/"),
+            ("Best Heist Movies", "https://editorial.rottentomatoes.com/guide/best-heist-movies-of-all-time/"),
+            ("Best Fantasy Movies", "https://editorial.rottentomatoes.com/guide/best-fantasy-movies-of-all-time/"),
+            ("37 Marvel MCU Movies", "https://editorial.rottentomatoes.com/guide/all-marvel-cinematic-universe-movies-ranked/"),
+            ("Best Computer-Animated Movies", "https://editorial.rottentomatoes.com/guide/best-computer-animated-movies-of-all-time/"),
+            ("50 Best Free Movies on Fandango at home", "https://editorial.rottentomatoes.com/guide/best-movies-fandango-at-home/"),
+            ("76 Disney Animated Movies", "https://editorial.rottentomatoes.com/guide/all-disney-animated-theatrical-movies-ranked-by-tomatometer/"),
+            ("100 Best Movies of 1995", "https://editorial.rottentomatoes.com/guide/best-movies-1995/"),
             ("Search Movies", "search_movies"),
         ]
         self.session.openWithCallback(self._browse_choice, ChoiceBox, title="Movies", list=menu)
@@ -891,8 +1006,17 @@ class CiefpRTMain(Screen):
             ("Hulu (Popular)", BASE + "/browse/tv_series_browse/affiliates:hulu~sort:popular"),
             ("AMC+ (Popular)", BASE + "/browse/tv_series_browse/affiliates:amc-plus~sort:popular"),
             ("Peacock (Popular)", BASE + "/browse/tv_series_browse/affiliates:peacock~sort:popular"),
-            ("Acorn TV (Popular)", BASE + "/browse/tv_series_browse/affiliates:acorn-tv~sort:popular"),
             ("Fandango at Home (Popular)", BASE + "/browse/tv_series_browse/affiliates:fandango-at-home~sort:popular"),
+            ("Acorn TV (Popular)", BASE + "/browse/tv_series_browse/affiliates:acorn-tv~sort:popular"),
+            ("Best TV Shows of 2026", "https://editorial.rottentomatoes.com/guide/best-new-tv-series-shows/"),
+            ("Best TV Shows of 2025", "https://editorial.rottentomatoes.com/guide/best-tv-shows-of-2025/"),
+            ("Best Series on Disney+ 2025", "https://editorial.rottentomatoes.com/guide/best-disney-plus-shows/"),
+            ("The Best Prime Video TV Shows 2026", "https://editorial.rottentomatoes.com/guide/best-tv-shows-and-movies-original-to-amazon-prime-video/"),
+            ("100 Best Netflix Series 2026", "https://editorial.rottentomatoes.com/guide/best-netflix-shows-and-movies-to-binge-watch-now/"),
+            ("Best Apple TV+ Original Series", "https://editorial.rottentomatoes.com/guide/best-apple-tv-plus-series-ranked/"),
+            ("HBO and HBO Max Series", "https://editorial.rottentomatoes.com/guide/best-hbo-series-of-all-time-ranked/"),
+            ("Best Hulu Shows", "https://editorial.rottentomatoes.com/guide/best-hulu-shows-and-movies-to-binge-watch-now/"),
+            ("34 Marvel TV Shows Ranked", "https://editorial.rottentomatoes.com/guide/marvel-tv-by-tomatometer/"),
             ("Search Series", "search_series"),
         ]
         self.session.openWithCallback(self._browse_choice, ChoiceBox, title="TV Series", list=menu)
@@ -991,8 +1115,8 @@ Cache: {get_cache_size():.1f}MB"""
                     self["meta"].setText("")
                     return
                 
-                # Limit to 30 results
-                display_results = results[:30]
+                # Limit to 150 results
+                display_results = results[:150]
                 
                 # Create choice list
                 choice_list = [(item["name"], item) for item in display_results]
@@ -1003,7 +1127,7 @@ Cache: {get_cache_size():.1f}MB"""
                     self._load_item_details(choice[1])
                 
                 title = f"Search Results: {query} ({len(results)} found)"
-                if len(results) > 30:
+                if len(results) > 100:
                     title += f" (showing 30)"
                     
                 self.session.openWithCallback(
@@ -1051,9 +1175,9 @@ Cache: {get_cache_size():.1f}MB"""
             items = parse_browse(url)
             
             # Limit to 30 items max
-            if len(items) > 30:
-                items = items[:30]
-                dlog(f"BROWSE: Limited to 30 items from {len(items)}")
+            if len(items) > 150:
+                items = items[:150]
+                dlog(f"BROWSE: Limited to 150 items from {len(items)}")
 
             def show_choice():
                 if self._closing or self._exiting:
