@@ -14,7 +14,7 @@ import math
 from Components.ActionMap import ActionMap
 from Components.Label import Label
 from Components.Pixmap import Pixmap
-from Components.config import config, ConfigSubsection, ConfigYesNo
+from Components.config import config, ConfigSubsection, ConfigYesNo, ConfigSelection
 from Screens.Screen import Screen
 from Screens.ChoiceBox import ChoiceBox
 from Screens.MessageBox import MessageBox
@@ -24,13 +24,18 @@ from Plugins.Plugin import PluginDescriptor
 
 
 PLUGIN_NAME = "CiefpRottenTomatoes"
-PLUGIN_VERSION = "1.1"
+PLUGIN_VERSION = "1.2"
 BASE = "https://www.rottentomatoes.com"
+
 
 CACHE_DIR = "/tmp/CiefpRottenTomatoes"
 CACHE_POSTERS = os.path.join(CACHE_DIR, "posters")
 CACHE_PAGES = os.path.join(CACHE_DIR, "pages")
 DEBUG_LOG = os.path.join(CACHE_DIR, "debug.log")
+
+BROWSE_PAGE_SIZE = 28   # RT tipično šalje 28-32 po "load more"
+BROWSE_MAX_ITEMS = 150  # tvoj limit
+LOAD_MORE_LABEL = ">> Load more..."
 
 PLUGIN_PATH = os.path.dirname(os.path.abspath(__file__))
 PLACEHOLDER_IMG = os.path.join(PLUGIN_PATH, "placeholder.png")
@@ -42,6 +47,10 @@ if not os.path.exists(PLACEHOLDER_IMG):
 config.plugins.ciefprt = ConfigSubsection()
 config.plugins.ciefprt.cache_enabled = ConfigYesNo(default=True)
 config.plugins.ciefprt.auto_epg = ConfigYesNo(default=True)
+config.plugins.ciefprt.max_items = ConfigSelection(
+    default="150",
+    choices=[("50","50"), ("100","100"), ("150","150"), ("200","200"), ("300","300")]
+)
 
 
 def ensure_dirs():
@@ -195,7 +204,8 @@ def search_rt(query, search_type="movie"):
         
         # Process movies
         if search_type == "movie" and "movies" in data:
-            for movie in data["movies"][:150]:
+            limit = int(config.plugins.ciefprt.max_items.value)
+            for movie in data["movies"][:limit]:
                 name = movie.get("name", "").strip()
                 year = movie.get("year", "")
                 url = movie.get("url", "")
@@ -212,7 +222,8 @@ def search_rt(query, search_type="movie"):
         
         # Process TV shows
         elif search_type == "tv" and "tvSeries" in data:
-            for tv in data["tvSeries"][:150]: 
+            limit = int(config.plugins.ciefprt.max_items.value)
+            for tv in data["tvSeries"][:limit]: 
                 name = tv.get("name", "").strip()
                 start_year = tv.get("startYear", "")
                 url = tv.get("url", "")
@@ -246,6 +257,30 @@ def search_rt_fallback(query, search_type="movie"):
         return parse_search_page(html, search_type)[:20]
     except Exception as e:
         dlog(f"SEARCH fallback error: {e}")
+        return []
+
+def parse_browse_api_page(browse_url, page=1, limit=BROWSE_PAGE_SIZE):
+    """
+    Load more za BASE /browse/... preko HTML ?page=N.
+    RT često vraća kumulativnu listu (page=2 ima i page=1 + još),
+    zato ovde vraćamo SVE stavke sa te stranice.
+    """
+    try:
+        parts = urllib.parse.urlsplit(browse_url)
+        q = urllib.parse.parse_qs(parts.query)
+
+        if page > 1:
+            q["page"] = [str(page)]
+        else:
+            q.pop("page", None)
+
+        new_query = urllib.parse.urlencode(q, doseq=True)
+        paged_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+        dlog("LOAD MORE URL: %s" % paged_url)
+
+        return parse_browse(paged_url) or []
+    except Exception as e:
+        dlog(f"BROWSE HTML page error: {e}")
         return []
 
 def parse_search_page(html, search_type="movie"):
@@ -714,7 +749,7 @@ class CiefpRTMain(Screen):
     def _show_startup_help(self):
         dlog("HELP: shown")
         txt = (
-            "Welcome to Ciefp Rotten Tomatoes 1.1\n\n"
+            "Welcome to Ciefp Rotten Tomatoes 1.2\n\n"
             "GREEN  = Movies\n"
             "YELLOW = Series\n"
             "BLUE   = Settings\n"
@@ -723,9 +758,6 @@ class CiefpRTMain(Screen):
             "Use Settings -> Clear Cache\n"
             "to free memory if plugin becomes slow.\n\n"
             "Press any key to continue...\n\n"
-            "v1.2 ideas:\n"
-            "- Load more for BASE /browse/\n"
-            "- Configurable max items load\n\n"
             "Website data provided by RottenTomatoes.com\n"
         )
         self["help"].setText(txt)
@@ -957,6 +989,19 @@ class CiefpRTMain(Screen):
             ("In theaters (Critic lowest)", BASE + "/browse/movies_in_theaters/sort:critic_lowest"),
             ("In theaters (Audience highest)", BASE + "/browse/movies_in_theaters/sort:audience_highest"),
             ("In theaters (Audience lowest)", BASE + "/browse/movies_in_theaters/sort:audience_lowest"),
+            ("Best Sci-Fi Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:sci_fi~sort:popular"),
+            ("Best Mystery & Thriller Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:mystery_and_thriller~sort:popular"),
+            ("Best Action Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:action~sort:popular"),
+            ("Best Drama Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:drama~sort:popular"),
+            ("Best Comedy Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:comedy~sort:popular"),
+            ("Best Crime Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:crime~sort:popular"),
+            ("Best Adventure Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:adventure~sort:popular"),
+            ("Best Romance Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:romance~sort:popular"),
+            ("Best Biography Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:biography~sort:popular"),
+            ("Best Sports Movies in Theaters (2026)", BASE + "/browse/movies_in_theaters/genres:sports~sort:popular"),
+            ("Best Movies to Stream at Home (2026)", BASE + "/browse/movies_at_home/sort:popular"),
+            ("Best Sci-Fi Movies to Stream at Home (2026)", BASE + "/browse/movies_at_home/genres:sci_fi~sort:popular"),
+            ("Best Mystery & Thriller Movies to Stream at Home(2026)", BASE + "/browse/movies_at_home/genres:mystery_and_thriller~sort:popular"),
             ("At home", BASE + "/browse/movies_at_home/"),
             ("Coming soon", BASE + "/browse/movies_coming_soon/"),
             ("Best New Movies", "https://editorial.rottentomatoes.com/guide/best-new-movies/"),
@@ -1008,6 +1053,18 @@ class CiefpRTMain(Screen):
             ("Peacock (Popular)", BASE + "/browse/tv_series_browse/affiliates:peacock~sort:popular"),
             ("Fandango at Home (Popular)", BASE + "/browse/tv_series_browse/affiliates:fandango-at-home~sort:popular"),
             ("Acorn TV (Popular)", BASE + "/browse/tv_series_browse/affiliates:acorn-tv~sort:popular"),
+            ("Best Sci-Fi TV Shows (2026)", BASE + "/browse/tv_series_browse/genres:sci_fi~sort:popular"),
+            ("Best Mystery & Thriller TV Shows (2026)", BASE + "/browse/tv_series_browse/genres:mystery_and_thriller~sort:popular"),
+            ("Best Action TV Shows (2026)", BASE + "/browse/tv_series_browse/genres:action~sort:popular"),
+            ("Best Drama TV Shows (2026)", BASE + "/browse/tv_series_browse/genres:drama~sort:popular"),
+            ("Best Crime TV Shows (2026)", BASE + "/browse/tv_series_browse/genres:crime~sort:popular"),
+            ("Best Comedy TV Shows (2026)", BASE + "/browse/tv_series_browse/genres:comedy~sort:popular"),
+            ("Sci-Fi TV Shows (A-Z)", BASE + "/browse/tv_series_browse/genres:sci_fi~sort:a_z"),
+            ("Action TV Shows (A-Z)", BASE + "/browse/tv_series_browse/genres:action~sort:a_z"),
+            ("Comedy TV Shows (A-Z)", BASE + "/browse/tv_series_browse/genres:comedy~sort:a_z"),
+            ("Drama TV Shows (A-Z)", BASE + "/browse/tv_series_browse/genres:drama~sort:a_z"),
+            ("Romance TV Shows (A-Z)", BASE + "/browse/tv_series_browse/genres:romance~sort:a_z"),
+            ("Mystery & Thriller TV Shows (A-Z)", BASE + "/browse/tv_series_browse/genres:mystery_and_thriller~sort:a_z"),
             ("Best TV Shows of 2026", "https://editorial.rottentomatoes.com/guide/best-new-tv-series-shows/"),
             ("Best TV Shows of 2025", "https://editorial.rottentomatoes.com/guide/best-tv-shows-of-2025/"),
             ("Best Series on Disney+ 2025", "https://editorial.rottentomatoes.com/guide/best-disney-plus-shows/"),
@@ -1034,6 +1091,7 @@ class CiefpRTMain(Screen):
             ("Show debug log (last 80 lines)", "showlog"),
             ("Clear debug log", "clearlog"),
             ("Auto EPG Search (current: %s)" % ("ON" if config.plugins.ciefprt.auto_epg.value else "OFF"), "auto_epg"),
+            ("Items load limit (current: %s)" % config.plugins.ciefprt.max_items.value, "max_items"),
             ("About", "about"),
         ]
         self.session.openWithCallback(self._settings_choice, ChoiceBox, title="Settings", list=menu)
@@ -1057,6 +1115,18 @@ class CiefpRTMain(Screen):
             config.plugins.ciefprt.auto_epg.save()
             status = "ON" if config.plugins.ciefprt.auto_epg.value else "OFF"
             self["status"].setText(f"Auto EPG: {status}")
+        elif key == "max_items":
+            opts = [("50", "50"), ("100", "100"), ("150", "150"), ("200", "200"), ("300", "300")]
+
+            def _set_limit(sel):
+                if not sel or self._closing or self._exiting:
+                    return
+                val = sel[1]
+                config.plugins.ciefprt.max_items.value = val
+                config.plugins.ciefprt.max_items.save()
+                self["status"].setText(f"Items limit set to: {val}")
+
+            self.session.openWithCallback(_set_limit, ChoiceBox, title="Select items load limit", list=opts)
         elif key == "about":
             about_text = f"""{PLUGIN_NAME} v{PLUGIN_VERSION}
 
@@ -1114,10 +1184,10 @@ Cache: {get_cache_size():.1f}MB"""
                     self["title"].setText("")
                     self["meta"].setText("")
                     return
-                
-                # Limit to 150 results
-                display_results = results[:150]
-                
+
+                limit = int(config.plugins.ciefprt.max_items.value)
+                display_results = results[:limit]
+
                 # Create choice list
                 choice_list = [(item["name"], item) for item in display_results]
                 
@@ -1127,8 +1197,9 @@ Cache: {get_cache_size():.1f}MB"""
                     self._load_item_details(choice[1])
                 
                 title = f"Search Results: {query} ({len(results)} found)"
-                if len(results) > 100:
-                    title += f" (showing 30)"
+                if len(results) > limit:
+                    title += f" (showing {limit})"
+
                     
                 self.session.openWithCallback(
                     item_chosen, 
@@ -1170,43 +1241,154 @@ Cache: {get_cache_size():.1f}MB"""
         try:
             if self._closing or self._exiting:
                 return
-                
+
             dlog("BROWSE: %s" % url)
-            items = parse_browse(url)
-            
-            # Limit to 30 items max
-            if len(items) > 150:
-                items = items[:150]
-                dlog(f"BROWSE: Limited to 150 items from {len(items)}")
+
+            # settings limit (fallback 150)
+            try:
+                max_limit = int(config.plugins.ciefprt.max_items.value)
+            except Exception:
+                max_limit = 150
+
+            # --- BASE /browse/... -> load more paging (HTML ?page=N) ---
+            if url.startswith(BASE + "/browse/"):
+                items = []
+                page = 1
+                has_more = True  # gasi se kad nema novih stavki
+
+                # Učitaj prvu stranu
+                first = parse_browse_api_page(url, page=1, limit=None) or []
+                if first:
+                    items = first
+                else:
+                    # fallback ako parse_browse_api_page iz nekog razloga ne vrati ništa
+                    items = parse_browse(url) or []
+
+                # hard cap odmah
+                if len(items) > max_limit:
+                    items = items[:max_limit]
+
+                def show_choice():
+                    if self._closing or self._exiting:
+                        return
+
+                    if not items:
+                        self["status"].setText("No items found")
+                        return
+
+                    choice_list = [(it.get("name", "???"), it) for it in items]
+
+                    # Load more na dnu samo ako:
+                    # - još ima prostora do max_limit
+                    # - i has_more je True
+                    if has_more and len(items) < max_limit:
+                        choice_list.append((LOAD_MORE_LABEL, {"__load_more__": True}))
+
+                    def item_chosen(choice):
+                        nonlocal page, has_more, items
+                        if not choice or self._closing or self._exiting:
+                            return
+
+                        payload = choice[1]
+
+                        # Klik na "Load more..."
+                        if isinstance(payload, dict) and payload.get("__load_more__"):
+                            def load_more_thread():
+                                nonlocal page, has_more, items
+                                try:
+                                    page += 1
+                                    self.ui(lambda: self["status"].setText("Loading more..."))
+
+                                    new_items = parse_browse_api_page(url, page=page, limit=None) or []
+                                    dlog("LOAD MORE: page=%s, got=%s" % (page, len(new_items)))
+
+                                    # Ako nema ništa -> nema više
+                                    if not new_items:
+                                        has_more = False
+                                        self.ui(show_choice)
+                                        return
+
+                                    # RT često vraća kumulativnu listu:
+                                    # page=2 sadrži i page=1 + nove stavke.
+                                    # Zato: ako je lista porasla -> REPLACE, ako nije -> STOP.
+                                    if len(new_items) > len(items):
+                                        items = new_items
+                                    else:
+                                        dlog("LOAD MORE: no new items -> stopping")
+                                        has_more = False
+                                        self.ui(show_choice)
+                                        return
+
+                                    # Dedup po URL (sigurnost)
+                                    seen = set()
+                                    deduped = []
+                                    for it in items:
+                                        u = (it.get("url") or "").strip()
+                                        if not u or u in seen:
+                                            continue
+                                        seen.add(u)
+                                        deduped.append(it)
+                                    items = deduped
+
+                                    # hard cap (settings)
+                                    if len(items) > max_limit:
+                                        items = items[:max_limit]
+                                        has_more = False  # ako smo dostigli limit, nema smisla nuditi još
+
+                                    self.ui(show_choice)
+
+                                except Exception as e:
+                                    dlog("LOAD MORE error: %s" % e)
+                                    self.ui(lambda: self["status"].setText("Load more failed"))
+                                    self.ui(show_choice)
+
+                            threading.Thread(
+                                target=self._thread_wrapper,
+                                args=(load_more_thread,),
+                                daemon=True
+                            ).start()
+                            return
+
+                        # Normalan izbor -> detalji
+                        self._load_item_details(payload)
+
+                    title = "Select (%d items)" % len(items)
+                    self.session.openWithCallback(item_chosen, ChoiceBox, title=title, list=choice_list)
+                    self["status"].setText("Loaded %d items" % len(items))
+
+                self.ui(show_choice)
+                return
+
+            # --- sve ostalo (editorial / search / šta god) ---
+            items = parse_browse(url) or []
+
+            if len(items) > max_limit:
+                items = items[:max_limit]
+                dlog("BROWSE: Limited to %d items" % max_limit)
 
             def show_choice():
                 if self._closing or self._exiting:
                     return
-                    
                 if not items:
                     self["status"].setText("No items found")
                     return
-                
-                choice_list = [(item["name"], item) for item in items]
-                
+
+                choice_list = [(it.get("name", "???"), it) for it in items]
+
                 def item_chosen(choice):
                     if not choice or self._closing or self._exiting:
                         return
                     self._load_item_details(choice[1])
-                
-                self.session.openWithCallback(
-                    item_chosen, 
-                    ChoiceBox, 
-                    title=f"Select ({len(items)} items)", 
-                    list=choice_list
-                )
-                self["status"].setText(f"Loaded {len(items)} items")
+
+                title = "Select (%d items)" % len(items)
+                self.session.openWithCallback(item_chosen, ChoiceBox, title=title, list=choice_list)
+                self["status"].setText("Loaded %d items" % len(items))
 
             self.ui(show_choice)
+
         except Exception as e:
-            dlog("BROWSE: EXCEPTION\n%s" % traceback.format_exc())
-            if not self._closing and not self._exiting:
-                self.ui(lambda: self["status"].setText("Load failed"))
+            dlog("BROWSE thread error: %s" % e)
+            self.ui(lambda: self["status"].setText("Browse failed"))
 
     # --- Load selected item ---
     def _load_item_details(self, item):
