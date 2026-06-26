@@ -24,7 +24,7 @@ from Plugins.Plugin import PluginDescriptor
 
 
 PLUGIN_NAME = "CiefpRottenTomatoes"
-PLUGIN_VERSION = "1.2"
+PLUGIN_VERSION = "1.3"
 BASE = "https://www.rottentomatoes.com"
 
 
@@ -51,8 +51,11 @@ config.plugins.ciefprt.max_items = ConfigSelection(
     default="150",
     choices=[("50","50"), ("100","100"), ("150","150"), ("200","200"), ("300","300")]
 )
-
-
+config.plugins.ciefprt.youtube_search = ConfigYesNo(default=True)
+config.plugins.ciefprt.player = ConfigSelection(  # NOVO
+    default="movieplayer",
+    choices=[("movieplayer", "Movie Player"), ("browser", "External Browser"), ("download", "Download & Play")]
+)
 def ensure_dirs():
     for p in (CACHE_DIR, CACHE_POSTERS, CACHE_PAGES):
         if not os.path.exists(p):
@@ -127,6 +130,254 @@ def http_get(url, timeout=8):
         raise
 
 
+def search_youtube_trailer(query, year=""):
+    """Search YouTube for trailer by title and year using yt-dlp"""
+    try:
+        import subprocess
+        import json
+
+        # Kreiraj search query
+        search_query = f"{query} official trailer"
+        if year:
+            search_query += f" {year}"
+
+        dlog(f"YT-SEARCH: Searching for '{search_query}'...")
+
+        # Koristi yt-dlp za pretragu YouTube-a
+        cmd = [
+            'yt-dlp',
+            '--flat-playlist',
+            '--dump-json',
+            '--no-warnings',
+            '--quiet',
+            f'ytsearch5:{search_query}'
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+        if result.returncode == 0:
+            # Parsiraj JSON linije (svaka linija je jedan video)
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    video_id = data.get('id')
+                    if video_id:
+                        title = data.get('title', '').lower()
+                        # Daj prednost onima koji imaju "trailer" u naslovu
+                        if 'trailer' in title or 'official' in title:
+                            url = f"https://www.youtube.com/watch?v={video_id}"
+                            dlog(f"YT-SEARCH: Found: {url}")
+                            return url
+                except json.JSONDecodeError:
+                    continue
+
+            # Ako nema sa "trailer", uzmi prvi rezultat
+            lines = result.stdout.strip().split('\n')
+            if lines:
+                try:
+                    data = json.loads(lines[0])
+                    video_id = data.get('id')
+                    if video_id:
+                        url = f"https://www.youtube.com/watch?v={video_id}"
+                        dlog(f"YT-SEARCH: Found (fallback): {url}")
+                        return url
+                except:
+                    pass
+
+        dlog("YT-SEARCH: No results found")
+        return None
+
+    except Exception as e:
+        dlog(f"YT-SEARCH error: {e}")
+        return None
+
+def play_video_with_movieplayer(session, url, title="Trailer"):
+    """Play video using Movie Player (enigma2 movie player)"""
+    try:
+        from enigma import eServiceCenter, eServiceReference
+
+        # Kreiraj service referencu za movie player
+        # 4097 = servicemp3 (podržava HLS, HTTP streamove)
+        service_ref = eServiceReference(
+            4097,  # Service type for stream
+            0,
+            url
+        )
+
+        # Postavi ime za prikaz
+        service_ref.setName(title)
+
+        if service_ref:
+            session.nav.playService(service_ref)
+            return True
+        return False
+    except Exception as e:
+        dlog(f"MoviePlayer error: {e}")
+        return False
+
+def fetch_trailer_url(tv_movie_url):
+    """Fetch trailer URL from Rotten Tomatoes internal API"""
+    try:
+        # Prvo dohvatimo HTML da izvučemo ID
+        html = http_get(tv_movie_url, timeout=10)
+        html_str = html.decode("utf-8", "ignore")
+
+        # Pokušaj pronaći ID u JSON-LD ili meta tagovima
+        # 1. Pokušaj iz media-scorecard-json
+        scorecard_match = re.search(
+            r'<script[^>]+id="media-scorecard-json"[^>]*>\s*({.*?})\s*</script>',
+            html_str, re.S | re.I
+        )
+
+        if scorecard_match:
+            try:
+                data = json.loads(scorecard_match.group(1))
+                # Pokušaj dobiti video ID
+                video_id = data.get("videoId") or data.get("id")
+                if video_id:
+                    return fetch_trailer_by_id(video_id)
+            except:
+                pass
+
+        # 2. Pokušaj pronaći u JSON-LD
+        ld_match = re.search(
+            r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
+            html_str, re.S | re.I
+        )
+        if ld_match:
+            try:
+                data = json.loads(ld_match.group(1))
+                if isinstance(data, dict):
+                    # Pokušaj različite putanje
+                    for key in ["video", "trailer", "videoId", "id"]:
+                        if key in data:
+                            video_data = data[key]
+                            if isinstance(video_data, dict):
+                                video_id = video_data.get("contentUrl") or video_data.get("url") or video_data.get(
+                                    "embedUrl")
+                                if video_id and ("m3u8" in video_id or "ts" in video_id):
+                                    return video_id
+                            elif isinstance(video_data, str):
+                                if "m3u8" in video_data or "ts" in video_data:
+                                    return video_data
+            except:
+                pass
+
+        # 3. Pokušaj pronaći u data-attributes
+        data_match = re.search(
+            r'<[^>]+data-video-id="([^"]+)"',
+            html_str, re.I
+        )
+        if data_match:
+            video_id = data_match.group(1)
+            return fetch_trailer_by_id(video_id)
+
+        # 4. Pokušaj pronaći bilo koji URL koji sadrži video
+        video_match = re.search(
+            r'(https?://[^\s"\']+video[^\s"\']*\.(?:m3u8|ts|mp4)[^\s"\']*)',
+            html_str, re.I
+        )
+        if video_match:
+            return video_match.group(1)
+
+        dlog("TRAILER: No video ID found in HTML")
+        return None
+
+    except Exception as e:
+        dlog(f"TRAILER API error: {e}")
+        return None
+
+
+def fetch_trailer_by_id(video_id):
+    """Fetch trailer URL using video ID from RT API"""
+    try:
+        # RT koristi nekoliko mogućih API endpointova
+        api_urls = [
+            f"https://www.rottentomatoes.com/api/private/v1.0/video/{video_id}",
+            f"https://www.rottentomatoes.com/api/private/v2.0/video/{video_id}",
+            f"https://www.rottentomatoes.com/api/private/v3.0/video/{video_id}",
+            f"https://www.rottentomatoes.com/api/private/v1.0/video/stream/{video_id}",
+        ]
+
+        for api_url in api_urls:
+            try:
+                dlog(f"TRAILER: Trying API: {api_url}")
+                raw = http_get(api_url, timeout=8)
+                data = json.loads(raw.decode("utf-8", "ignore"))
+
+                # Pokušaj pronaći video URL u odgovoru
+                if isinstance(data, dict):
+                    # Različite moguće putanje
+                    for path in ["video", "stream", "url", "contentUrl", "embedUrl", "sources"]:
+                        if path in data:
+                            video_data = data[path]
+                            if isinstance(video_data, list):
+                                for item in video_data:
+                                    if isinstance(item, dict):
+                                        url = item.get("url") or item.get("src") or item.get("contentUrl")
+                                        if url and (".m3u8" in url or ".ts" in url):
+                                            dlog(f"TRAILER: Found via API: {url}")
+                                            return url
+                            elif isinstance(video_data, str):
+                                if ".m3u8" in video_data or ".ts" in video_data:
+                                    dlog(f"TRAILER: Found via API: {video_data}")
+                                    return video_data
+
+                    # Pokušaj pronaći u nested strukturi
+                    if "data" in data:
+                        return fetch_trailer_by_id_from_data(data["data"])
+
+            except Exception as e:
+                dlog(f"TRAILER API {api_url} failed: {e}")
+                continue
+
+        return None
+
+    except Exception as e:
+        dlog(f"TRAILER fetch error: {e}")
+        return None
+
+def play_youtube_with_ytdlp(url):
+    """Get YouTube stream URL using yt-dlp"""
+    try:
+        import subprocess
+        import json
+
+        # Prvo probaj dobiti stream URL
+        cmd = ['yt-dlp', '-g', '-f', 'best[height<=720]', url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+        if result.returncode == 0:
+            stream_url = result.stdout.strip().split('\n')[0]
+            if stream_url:
+                dlog(f"YT-DLP: Got stream URL: {stream_url[:100]}...")
+                return stream_url
+        return None
+    except Exception as e:
+        dlog(f"YT-DLP error: {e}")
+        return None
+    
+
+def fetch_trailer_by_id_from_data(data):
+    """Helper function to extract trailer from nested data"""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in ["url", "src", "contentUrl", "embedUrl", "videoUrl"]:
+                if isinstance(value, str) and (".m3u8" in value or ".ts" in value):
+                    return value
+            if isinstance(value, (dict, list)):
+                result = fetch_trailer_by_id_from_data(value)
+                if result:
+                    return result
+    elif isinstance(data, list):
+        for item in data:
+            result = fetch_trailer_by_id_from_data(item)
+            if result:
+                return result
+    return None
+
 def cache_key(url):
     return re.sub(r"[^a-zA-Z0-9]+", "_", url).strip("_")
 
@@ -193,13 +444,15 @@ def normalize_rt_url(u):
 # ---------- Search functions ----------
 def search_rt(query, search_type="movie"):
     """Search Rotten Tomatoes using their API/autocomplete"""
-    # RT koristi autocomplete endpoint za pretragu
-    search_url = f"{BASE}/api/autocomplete?v=1&query={urllib.parse.quote(query)}"
-    
+    # Očisti query prije slanja
+    clean_query = re.sub(r'[:;!?]', ' ', query)
+    clean_query = re.sub(r'\s+', ' ', clean_query).strip()
+
+    search_url = f"{BASE}/api/autocomplete?v=1&query={urllib.parse.quote(clean_query)}"
+
     try:
         raw = http_get(search_url, timeout=10)
         data = json.loads(raw.decode("utf-8", "ignore"))
-        
         results = []
         
         # Process movies
@@ -243,21 +496,171 @@ def search_rt(query, search_type="movie"):
 
                     return results
 
+        # ... ostatak koda ...
     except Exception as e:
         dlog(f"SEARCH API error: {e}")
-        # Fallback to old method
-        return search_rt_fallback(query, search_type)
+        return search_rt_fallback(clean_query, search_type)
+
 
 def search_rt_fallback(query, search_type="movie"):
-    """Fallback search using RT search page (/search?search=...)"""
+    """Fallback search using RT search page - parses Shadow DOM content"""
     try:
-        url = f"{BASE}/search?search={urllib.parse.quote(query)}"
-        raw = http_get(url, timeout=10)
+        # Očisti query - pretvori & u and
+        clean_query = re.sub(r'[&]', 'and', query)
+        clean_query = re.sub(r'[:;!?]', ' ', clean_query)
+        clean_query = re.sub(r'\s+', ' ', clean_query).strip()
+
+        search_url = f"{BASE}/search?search={urllib.parse.quote(clean_query)}"
+        dlog(f"SEARCH: Fallback URL: {search_url}")
+
+        raw = http_get(search_url, timeout=10)
         html = raw.decode("utf-8", "ignore")
-        return parse_search_page(html, search_type)[:20]
+
+        results = []
+
+        # --- METODA 1: Traži search-page-media-row elemente ---
+        # Ovi elementi sadrže podatke u atributima
+        for m in re.finditer(
+                r'<search-page-media-row[^>]*?'
+                r'data-qa="data-row"[^>]*?'
+                r'release-year="([^"]*)"[^>]*?'
+                r'tomatometer-score="([^"]*)"[^>]*?'
+                r'tomatometer-sentiment="([^"]*)"[^>]*?'
+                r'>(.*?)</search-page-media-row>',
+                html, re.I | re.S
+        ):
+            release_year = m.group(1).strip()
+            tomatometer = m.group(2).strip()
+            sentiment = m.group(3).strip()
+            inner_html = m.group(4)
+
+            # Ekstrakcija URL-a - traži <a href="..."> unutar
+            href_match = re.search(r'<a[^>]+href="([^"]+)"[^>]*>', inner_html, re.I)
+            if not href_match:
+                continue
+            href = href_match.group(1).strip()
+
+            # Filtriranje po tipu
+            if search_type == "movie" and not href.startswith("/m/"):
+                continue
+            if search_type == "tv" and not href.startswith("/tv/"):
+                continue
+
+            # Ekstrakcija naslova
+            title = ""
+            title_match = re.search(r'<a[^>]+data-qa="info-name"[^>]*>(.*?)</a>', inner_html, re.I | re.S)
+            if title_match:
+                title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                title = re.sub(r'\s+', ' ', title)
+
+            # Ako nema data-qa, probaj drugi način
+            if not title:
+                title_match = re.search(r'<a[^>]+slot="title"[^>]*>(.*?)</a>', inner_html, re.I | re.S)
+                if title_match:
+                    title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                    title = re.sub(r'\s+', ' ', title)
+
+            if not title:
+                continue
+
+            # Godina iz release-year atributa ili iz naslova
+            year = release_year
+            if not year:
+                year_match = re.search(r'\((\d{4})\)', title)
+                if year_match:
+                    year = year_match.group(1)
+                    title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
+
+            # Ekstrakcija slike
+            image = ""
+            img_match = re.search(r'<img[^>]+src="([^"]+)"', inner_html, re.I)
+            if img_match:
+                image = img_match.group(1).strip()
+
+            display_name = f"{title} ({year})" if year else title
+            results.append({
+                "name": display_name,
+                "url": normalize_rt_url(href),
+                "image": image,
+                "year": year
+            })
+            dlog(f"SEARCH: Found: {display_name} -> {href}")
+
+        # --- METODA 2: Ako nema rezultata, probaj sa JSON-LD ---
+        if not results:
+            dlog("SEARCH: No search-page-media-row found, trying JSON-LD...")
+            for script in re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S | re.I):
+                try:
+                    data = json.loads(script.strip())
+                    if isinstance(data, dict):
+                        # Pokušaj pronaći ItemList
+                        if data.get("@type") == "ItemList":
+                            items = data.get("itemListElement", [])
+                            for item in items:
+                                if isinstance(item, dict):
+                                    name = item.get("name", "")
+                                    url = item.get("url", "")
+                                    if name and url:
+                                        if search_type == "movie" and not url.startswith("/m/"):
+                                            continue
+                                        if search_type == "tv" and not url.startswith("/tv/"):
+                                            continue
+                                        results.append({
+                                            "name": name,
+                                            "url": normalize_rt_url(url),
+                                            "image": "",
+                                            "year": ""
+                                        })
+                                        dlog(f"SEARCH: Found via JSON-LD: {name}")
+                except:
+                    pass
+
+        # --- METODA 3: Konačni fallback - direktno iz URL-a ---
+        if not results:
+            dlog("SEARCH: Trying direct URL construction...")
+            # Pokušaj s različitim formatima URL-a
+            possible_slugs = [
+                clean_query.lower().replace(' ', '_'),
+                clean_query.lower().replace(' ', '-'),
+                clean_query.lower().replace(' ', ''),
+            ]
+            # Dodaj i specifične varijante za Mr. & Mrs. Smith
+            if "mr" in clean_query.lower() and "mrs" in clean_query.lower():
+                possible_slugs.extend([
+                    "mr_and_mrs_smith",
+                    "mr_and_mrs_smith_2005",
+                    "mr_and_mrs_smith_2024",
+                    "1014325-mr_and_mrs_smith"
+                ])
+
+            for slug in possible_slugs:
+                test_url = f"{BASE}/m/{slug}"
+                try:
+                    req = urllib.request.Request(test_url)
+                    req.add_header("User-Agent", "Mozilla/5.0")
+                    req.get_method = lambda: 'HEAD'
+                    with urllib.request.urlopen(req, context=ssl_ctx(), timeout=5) as r:
+                        if r.getcode() == 200:
+                            results.append({
+                                "name": clean_query,
+                                "url": test_url,
+                                "image": "",
+                                "year": ""
+                            })
+                            dlog(f"SEARCH: Found via direct URL: {test_url}")
+                            break
+                except:
+                    continue
+
+        dlog(f"SEARCH: Fallback found {len(results)} results")
+        return results[:20]
+
     except Exception as e:
         dlog(f"SEARCH fallback error: {e}")
+        import traceback
+        dlog(traceback.format_exc())
         return []
+
 
 def parse_browse_api_page(browse_url, page=1, limit=BROWSE_PAGE_SIZE):
     """
@@ -354,76 +757,77 @@ def extract_jsonld_itemlist(html_text):
                     return ile
     return []
 
+
 def parse_editorial_guide(url):
     raw = get_cached_page(url) or http_get(url)
     set_cached_page(url, raw)
     html = raw.decode("utf-8", "ignore")
 
     out = []
+    seen_urls = set()
 
-    # UHVATI CEO countdown-item blok:
-    # - radi i kad NEMA <br>
-    # - radi i kad ima <br>
-    # - blok ide do sledeceg row-index ili kraja dokumenta
-    item_re = re.compile(
-        r'(<div[^>]+id="row-index-[^"]*"[^>]+class=[\'"][^\'"]*countdown-item[^\'"]*[\'"][^>]*>.*?)(?=(<div[^>]+id="row-index-|$))',
+    # --- Pronađi sve block-countdown divove ---
+    # Ovo je glavni kontejner za svaku stavku na editorial stranicama
+    block_re = re.compile(
+        r'<div[^>]+id="countdown-index-\d+"[^>]+class="[^"]*block-countdown[^"]*"[^>]*>(.*?)</div>\s*(?:<br>|</div>|$)',
         re.I | re.S
     )
 
-    # helper: nadji link postera / item URL
-    href_re = re.compile(
-        r'<a[^>]+class=[\'"][^\'"]*article_movie_poster[^\'"]*[\'"][^>]+href=[\'"]([^\'"]+)[\'"]',
-        re.I
-    )
+    for block_match in block_re.finditer(html):
+        block = block_match.group(1)
 
-    # helper: title (iz h2->a) ili iz article_movie_title->a
-    title_re = re.compile(
-        r'<div[^>]+class=[\'"][^\'"]*article_movie_title[^\'"]*[\'"][^>]*>.*?<a[^>]*href=[\'"][^\'"]*[\'"][^>]*>\s*([^<]+?)\s*</a>',
-        re.I | re.S
-    )
-
-    # poster img (single ili double quotes)
-    img_re = re.compile(
-        r'<img[^>]+class=[\'"][^\'"]*article_poster[^\'"]*[\'"][^>]+src=[\'"]([^\'"]+)[\'"]',
-        re.I
-    )
-
-    # godina
-    year_re = re.compile(
-        r"<span[^>]+class=[\'\"]subtle start-year[\'\"][^>]*>\s*\((\d{4})\)\s*</span>",
-        re.I
-    )
-
-    for m in item_re.finditer(html):
-        block = m.group(1)
-
-        hm = href_re.search(block)
-        if not hm:
+        # --- Izdvoji link (href) ---
+        href_match = re.search(
+            r'<a[^>]+class="[^"]*poster-wrapper[^"]*"[^>]+href="([^"]+)"',
+            block, re.I
+        )
+        if not href_match:
             continue
-
-        href = (hm.group(1) or "").strip()
+        href = (href_match.group(1) or "").strip()
         if not href:
-            # Disney ima template red sa href="" -> preskoci
             continue
 
+        # --- Izdvoji sliku ---
+        img_match = re.search(
+            r'<img[^>]+class="[^"]*article_poster[^"]*"[^>]+src="([^"]+)"',
+            block, re.I
+        )
+        img = (img_match.group(1) or "").strip() if img_match else ""
+
+        # --- Izdvoji naslov (meta-title) ---
+        title_match = re.search(
+            r'<a[^>]+class="[^"]*meta-title[^"]*"[^>]*>(.*?)</a>',
+            block, re.I | re.S
+        )
+        if not title_match:
+            continue
+        title = (title_match.group(1) or "").strip()
+        title = re.sub(r'<[^>]+>', '', title)
+        title = re.sub(r'\s+', ' ', title).strip()
+
+        if not title:
+            continue
+
+        # --- Izdvoji godine ako postoje u naslovu ---
+        year = ""
+        year_match = re.search(r'\((\d{4})\)', title)
+        if year_match:
+            year = year_match.group(1)
+            title = re.sub(r'\s*\(\d{4}\)', '', title).strip()
+
+        # --- Normaliziraj URL ---
         item_url = normalize_rt_url(href)
 
-        tm = title_re.search(block)
-        name = (tm.group(1).strip() if tm else "")
-        if not name:
+        # --- Spriječi duplikate ---
+        if item_url in seen_urls:
             continue
+        seen_urls.add(item_url)
 
-        ym = year_re.search(block)
-        year = ym.group(1) if ym else ""
-
-        im = img_re.search(block)
-        img = (im.group(1).strip() if im else "")
-
-        # dodaj godinu u naziv (ako postoji)
+        # --- Kreiraj rezultat ---
         if year:
-            display_name = "%s (%s)" % (name, year)
+            display_name = f"{title} ({year})"
         else:
-            display_name = name
+            display_name = title
 
         out.append({
             "name": display_name,
@@ -431,13 +835,58 @@ def parse_editorial_guide(url):
             "image": img
         })
 
+    # --- Ako nismo našli ništa, probaj sa starom metodom (kao fallback) ---
+    if not out:
+        # Ovdje možeš staviti tvoj stari kod kao fallback
+        dlog(f"EDITORIAL: No items found with primary parser, trying fallback...")
+
+        # Pokušaj sa <article> elementima (stari način)
+        article_re = re.compile(
+            r'<article[^>]*data-rank[^>]*>.*?'
+            r'<a[^>]+href="([^"]+)"[^>]*>.*?'
+            r'<img[^>]+src="([^"]+)"[^>]*>.*?'
+            r'<h[23][^>]*>(.*?)</h[23]>',
+            re.I | re.S
+        )
+
+        for m in article_re.finditer(html):
+            href = (m.group(1) or "").strip()
+            img = (m.group(2) or "").strip()
+            title = (m.group(3) or "").strip()
+            title = re.sub(r'<[^>]+>', '', title)
+            title = re.sub(r'\s+', ' ', title).strip()
+
+            if href and title:
+                year = ""
+                year_match = re.search(r'\((\d{4})\)', title)
+                if year_match:
+                    year = year_match.group(1)
+                    title = re.sub(r'\s*\(\d{4}\)', '', title).strip()
+
+                item_url = normalize_rt_url(href)
+
+                if item_url not in seen_urls:
+                    seen_urls.add(item_url)
+                    if year:
+                        display_name = f"{title} ({year})"
+                    else:
+                        display_name = title
+
+                    out.append({
+                        "name": display_name,
+                        "url": item_url,
+                        "image": img
+                    })
+
+    dlog(f"EDITORIAL: Found {len(out)} items from {url}")
     return out
 
-
 def parse_browse(url):
+    dlog(f"BROWSE: Parsing URL: {url}")
 
     # --- EDITORIAL fallback ---
     if "editorial.rottentomatoes.com" in (url or ""):
+        dlog("BROWSE: Using editorial parser")
         return parse_editorial_guide(url)
 
     raw = get_cached_page(url) or http_get(url)
@@ -488,7 +937,45 @@ def extract_jsonld_movie_tv(html_text):
             return obj
     return None
 
-def parse_detail(html):
+
+def extract_title_from_html(html):
+    """Extract title and year from RT page HTML"""
+    title = ""
+    year = ""
+
+    # Pokušaj izvući iz title taga
+    title_match = re.search(r'<title>(.*?)</title>', html, re.I)
+    if title_match:
+        title = title_match.group(1).strip()
+        # Očisti " - Rotten Tomatoes" i slično
+        title = re.sub(r'\s*[-|]\s*Rotten Tomatoes.*$', '', title, flags=re.I)
+        title = re.sub(r'\s*[-|]\s*TV.*$', '', title, flags=re.I)
+
+    # Ako nema title, pokušaj iz og:title
+    if not title:
+        title_match = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html, re.I)
+        if title_match:
+            title = title_match.group(1).strip()
+            title = re.sub(r'\s*[-|]\s*Rotten Tomatoes.*$', '', title, flags=re.I)
+
+    # Izvuci godinu
+    year_match = re.search(r'\((\d{4})\)', html)
+    if year_match:
+        year = year_match.group(1)
+    else:
+        # Pokušaj iz title-a
+        year_match = re.search(r'\((\d{4})\)', title)
+        if year_match:
+            year = year_match.group(1)
+            title = re.sub(r'\s*\(\d{4}\)\s*$', '', title)
+
+    # Očisti title
+    title = title.strip()
+    title = re.sub(r'\s+', ' ', title)
+
+    return title, year
+
+def parse_detail(html, detail_url=None):
     info = {
         "mpaa": "",
         "status": "",
@@ -505,6 +992,8 @@ def parse_detail(html):
         "critic_count": "",
         "popcorn": "",
         "audience_count": "",
+        "trailer_url": "",
+        "trailer_type": "",
     }
 
     # poster fallback (og:image)
@@ -512,7 +1001,7 @@ def parse_detail(html):
     if m:
         info["poster_url"] = (m.group(1) or "").strip()
 
-    # Backdrop / Theme (rt-img slot="iconic") - src can contain multiple URLs separated by commas
+    # Backdrop / Theme (rt-img slot="iconic")
     m = re.search(r'<rt-img[^>]+slot="iconic"[^>]+src="([^"]+)"', html, re.I)
     if m:
         src = (m.group(1) or "").strip()
@@ -520,8 +1009,7 @@ def parse_detail(html):
         if parts:
             info["backdrop_url"] = parts[-1]
 
-
-    # scores + description (najstabilnije na novom RT)
+    # scores + description
     m = re.search(
         r'<script[^>]+id="media-scorecard-json"[^>]*>\s*({.*?})\s*</script>',
         html, re.S | re.I
@@ -536,7 +1024,6 @@ def parse_detail(html):
             info["critic_count"] = str(critics.get("reviewCount", "") or "")
 
             info["popcorn"] = str(audience.get("scorePercent", "") or "")
-            # RT često ima "100+ Verified Ratings" u bandedRatingCount
             info["audience_count"] = str(audience.get("bandedRatingCount", "") or audience.get("ratingCount", "") or "")
 
             if data.get("description"):
@@ -544,14 +1031,14 @@ def parse_detail(html):
         except:
             pass
 
-    # metadata-prop (PG, Now Playing, 1h 44m ...)
+    # metadata-prop
     props = re.findall(
         r'<rt-text[^>]+slot="metadata-prop"[^>]*>\s*([^<]+)\s*</rt-text>',
         html, flags=re.I
     )
     props = [p.strip() for p in props if p and p.strip()]
 
-    # genres (Documentary, Biography...)
+    # genres
     genres = re.findall(
         r'<rt-text[^>]+slot="metadata-genre"[^>]*>\s*([^<]+)\s*</rt-text>',
         html, flags=re.I
@@ -560,13 +1047,10 @@ def parse_detail(html):
 
     # map props -> fields
     for p in props:
-        # MPAA rating: PG, R, PG-13, TV-MA...
         if re.match(r'^[A-Z0-9][A-Z0-9\-]{0,6}$', p) and not info["mpaa"]:
             info["mpaa"] = p
-        # runtime: "1h 44m" / "44m"
         elif ("h" in p and "m" in p) or re.match(r"^\d+\s*m$", p, re.I):
             info["runtime"] = p
-        # status: "Now Playing", "Streaming Now", etc
         elif "playing" in p.lower() or "stream" in p.lower() or "premiere" in p.lower():
             info["status"] = p
     if genres:
@@ -575,7 +1059,6 @@ def parse_detail(html):
     # --- Cast & Crew (JSON-LD) ---
     j = extract_jsonld_movie_tv(html)
     if j:
-        # directors
         directors = j.get("director")
         dir_names = []
         if isinstance(directors, dict) and directors.get("name"):
@@ -587,7 +1070,6 @@ def parse_detail(html):
         if dir_names:
             info["director"] = ", ".join(dir_names[:2])
 
-        # cast / actors
         actors = j.get("actor") or j.get("actors")
         cast_names = []
         if isinstance(actors, dict) and actors.get("name"):
@@ -601,58 +1083,143 @@ def parse_detail(html):
         if cast_names:
             info["cast"] = ", ".join(cast_names[:8])
 
+    # --- Ekstrakcija trejlera ---
+    # 1. Video element sa data-sources
+    video_match = re.search(
+        r'<video[^>]+data-sources="([^"]+)"',
+        html, re.I
+    )
+    if video_match:
+        try:
+            sources = json.loads(video_match.group(1))
+            for src in sources:
+                if src.get("type") == "application/x-mpegURL":
+                    info["trailer_url"] = src.get("src", "")
+                    info["trailer_type"] = "hls"
+                    break
+        except:
+            pass
+
+    # 2. Video tag sa src
+    if not info["trailer_url"]:
+        video_match = re.search(
+            r'<video[^>]+src="([^"]+)"[^>]*>',
+            html, re.I
+        )
+        if video_match:
+            url = video_match.group(1)
+            if ".m3u8" in url or ".ts" in url:
+                info["trailer_url"] = url
+                info["trailer_type"] = "hls"
+
+    # 3. Bilo koji .m3u8 ili .ts link
+    if not info["trailer_url"]:
+        stream_match = re.search(
+            r'(https?://[^\s"\']+\.(?:m3u8|ts)[^\s"\']*)',
+            html, re.I
+        )
+        if stream_match:
+            info["trailer_url"] = stream_match.group(1)
+            info["trailer_type"] = "hls"
+
+    # 4. YouTube trailer
+    if not info["trailer_url"] and config.plugins.ciefprt.youtube_search.value:
+        dlog("TRAILER: No trailer found, searching YouTube...")
+        try:
+            title, year = extract_title_from_html(html)
+            if title:
+                dlog(f"TRAILER: Searching YouTube for '{title}' ({year})...")
+                youtube_url = search_youtube_trailer(title, year)
+                if youtube_url:
+                    info["trailer_url"] = youtube_url
+                    info["trailer_type"] = "youtube"
+                    dlog(f"TRAILER: Found on YouTube: {youtube_url}")
+                else:
+                    dlog("TRAILER: No YouTube trailer found")
+            else:
+                dlog("TRAILER: Could not extract title for YouTube search")
+        except Exception as e:
+            dlog(f"TRAILER YouTube search error: {e}")
+
+    # 5. API fallback (samo ako imamo detail_url)
+    if not info["trailer_url"] and detail_url:
+        dlog("TRAILER: No trailer found in HTML, trying API...")
+        try:
+            trailer_url = fetch_trailer_url(detail_url)
+            if trailer_url:
+                info["trailer_url"] = trailer_url
+                info["trailer_type"] = "hls"
+                dlog(f"TRAILER: Found via API: {trailer_url}")
+        except Exception as e:
+            dlog(f"TRAILER API error: {e}")
+
     return info
 
 # ---------- EPG functions ----------
 def get_current_epg_info(session):
     """Get current EPG information for the playing channel"""
     try:
-        # Get current service reference
         from ServiceReference import ServiceReference
+        from enigma import eEPGCache
+
         current_service = session.nav.getCurrentlyPlayingServiceReference()
-        
         if not current_service:
+            dlog("EPG: No current service")
             return None
-            
-        # Get service name
+
         service_ref = ServiceReference(current_service)
         service_name = service_ref.getServiceName()
-        
-        # Try to get EPG event info
-        from enigma import eEPGCache
+        dlog(f"EPG: Service name: {service_name}")
+
         epgcache = eEPGCache.getInstance()
-        
-        if epgcache:
-            event_id = None
-            # Try to get current event
+        if not epgcache:
+            dlog("EPG: No EPG cache available")
+            return {"title": service_name, "channel": service_name}
+
+        try:
             events = epgcache.lookupEvent(["IBDCT", (current_service.toString(), 0, -1, -1)])
-            if events:
-                for event in events:
-                    event_name = event[4]  # Event title
-                    event_desc = event[5]  # Event description
+            dlog(f"EPG: Events found: {len(events) if events else 0}")
+        except Exception as e:
+            dlog(f"EPG: lookupEvent error: {e}")
+            events = []
+
+        if events:
+            for event in events:
+                try:
+                    # Podrška za evente sa 5 ili 6 elemenata
+                    if len(event) < 5:
+                        dlog(f"EPG: Event too short: {len(event)} elements")
+                        continue
+
+                    # event[4] je uvijek title (u većini Enigma2 verzija)
+                    event_name = event[4] if len(event) > 4 else ""
+                    event_desc = event[5] if len(event) > 5 else ""
+
                     if event_name:
-                        # Clean up the title - remove year and other info in parentheses
-                        clean_title = re.sub(r'\s*\(\d{4}\)', '', event_name)  # Remove (2023)
-                        clean_title = re.sub(r'\s*-\s*.*$', '', clean_title)  # Remove - Part 1 etc
+                        clean_title = re.sub(r'\s*\(\d{4}\)', '', event_name)
+                        clean_title = re.sub(r'\s*-\s*.*$', '', clean_title)
                         clean_title = clean_title.strip()
-                        
-                        return {
-                            "title": clean_title,
-                            "original_title": event_name,
-                            "description": event_desc or "",
-                            "channel": service_name
-                        }
-        
-        # Fallback: just return service/channel name
-        return {
-            "title": service_name,
-            "channel": service_name
-        }
-        
+
+                        # Preskoči ako je title prazan ili samo naziv kanala
+                        if clean_title and clean_title != service_name:
+                            dlog(f"EPG: Found event: {clean_title}")
+                            return {
+                                "title": clean_title,
+                                "original_title": event_name,
+                                "description": event_desc or "",
+                                "channel": service_name
+                            }
+                except Exception as e:
+                    dlog(f"EPG: Event parsing error: {e}")
+                    continue
+
+        # Fallback - koristi samo naziv kanala
+        dlog("EPG: Using fallback - service name only")
+        return {"title": service_name, "channel": service_name}
+
     except Exception as e:
         dlog(f"EPG error: {e}")
         return None
-
 
 # ---------- UI ----------
 class CiefpRTMain(Screen):
@@ -686,6 +1253,8 @@ class CiefpRTMain(Screen):
         <eLabel text="Series" position="665,1002" size="220,45" font="Regular;26" />
         <ePixmap pixmap="buttons/blue.png" position="910,1010" size="35,35" alphatest="blend" />
         <eLabel text="Settings" position="955,1002" size="340,45" font="Regular;26" />
+        <ePixmap pixmap="buttons/key_menu.png" position="1210,1010" size="45,45" alphatest="blend" />
+        <eLabel text="▶Trailer" position="1260,1002" size="440,45" font="Regular;26" foregroundColor="#ffffff" />
     </screen>
     """
 
@@ -710,7 +1279,9 @@ class CiefpRTMain(Screen):
         self.current_detail = {}
         self._closing = False
         self._exiting = False
-        
+        self._trailer_data = None  # NOVO
+        self.onClose.append(self._on_main_close)
+
         # UI dispatcher
         self._uiq = []
         self._uit = eTimer()
@@ -721,7 +1292,7 @@ class CiefpRTMain(Screen):
         self.picload.PictureData.get().append(self._on_pic_ready)
 
         self["actions"] = ActionMap(
-            ["OkCancelActions", "ColorActions"],
+            ["OkCancelActions", "ColorActions", "MenuActions"],
             {
                 "cancel": self.exit,
                 "red": self.exit,
@@ -729,6 +1300,7 @@ class CiefpRTMain(Screen):
                 "yellow": self.open_series_menu,
                 "blue": self.open_settings_menu,
                 "ok": self.open_item_menu,
+                "menu": self._play_trailer_direct,  # NOVO - bijelo dugme za trejler
             },
             -1
         )
@@ -737,6 +1309,7 @@ class CiefpRTMain(Screen):
         # timers (držimo reference da ne budu GC)
         self._epgTimer = eTimer()
         self._epgTimer.callback.append(self._check_epg)
+        self._epgTimer.start(1000, True)  # Provjeri nakon 1 sekunde
 
         self._phTimer = eTimer()
         self._phTimer.callback.append(self._show_placeholder)
@@ -745,15 +1318,23 @@ class CiefpRTMain(Screen):
         self.onLayoutFinish.append(self._show_placeholder)
         # U __init__ metodi, na samom kraju:
         self.onLayoutFinish.append(self._show_startup_help)
+        self.onLayoutFinish.append(self._check_epg)
 
     def _show_startup_help(self):
+        """Show startup help screen"""
+        # Ako već imamo učitane detalje, ne prikazuj help
+        if self.current_item or self.current_detail:
+            dlog("HELP: Skipping - details already loaded")
+            return
+
         dlog("HELP: shown")
         txt = (
-            "Welcome to Ciefp Rotten Tomatoes 1.2\n\n"
+            "Welcome to Ciefp Rotten Tomatoes 1.3\n\n"
             "GREEN  = Movies\n"
             "YELLOW = Series\n"
             "BLUE   = Settings\n"
-            "OK     = Cast & Crew Backdrop\n\n"
+            "OK     = Cast & Crew Backdrop\n"
+            "MENU   = Play Trailer\n\n"
             "Tip:\n"
             "Use Settings -> Clear Cache\n"
             "to free memory if plugin becomes slow.\n\n"
@@ -769,6 +1350,11 @@ class CiefpRTMain(Screen):
         try:
             if self._closing or self._exiting:
                 return
+
+            # Sakrij help ako je prikazan
+            if self.showing_help:
+                self["help"].hide()
+                self.showing_help = False
 
             # widget još nije spreman -> pokušaj opet za 200ms
             if not self["poster"].instance:
@@ -802,7 +1388,12 @@ class CiefpRTMain(Screen):
 
     # --- UI queue helpers ---
     def ui(self, fn):
-        if self._closing or self._exiting:
+        """UI thread dispatcher"""
+        if not hasattr(self, '_uiq'):
+            self._uiq = []
+        if hasattr(self, '_closing') and self._closing:
+            return
+        if hasattr(self, '_exiting') and self._exiting:
             return
         self._uiq.append(fn)
 
@@ -902,28 +1493,42 @@ class CiefpRTMain(Screen):
     def onFirstShow(self):
         """Called when screen is first shown"""
         Screen.onFirstShow(self)
-        
+
         # Show placeholder immediately
         self._show_placeholder()
-        self._show_startup_help()
+
+        # Samo ako nema učitane stavke, prikaži help
+        if not self.current_item:
+            self._show_startup_help()
 
         # Check if auto EPG is enabled
         if config.plugins.ciefprt.auto_epg.value:
             self._epgTimer.start(1000, True)
 
-
     def _check_epg(self):
         """Check EPG and auto-search current program"""
+        dlog("EPG: _check_epg called")  # NOVO - debug
+
         if self._closing or self._exiting:
+            dlog("EPG: Screen is closing, skipping")
             return
-            
+
+        # Provjeri da li je Auto EPG uključen
+        if not config.plugins.ciefprt.auto_epg.value:
+            dlog("EPG: Auto EPG is disabled in settings")
+            self["status"].setText("Auto EPG disabled")
+            return
+
         epg_info = get_current_epg_info(self.session)
+        dlog(f"EPG: Got info: {epg_info}")  # NOVO - debug
+
         if epg_info and epg_info.get("title"):
             title = epg_info["title"]
+            dlog(f"EPG: Searching for '{title}'")  # NOVO - debug
             self["status"].setText(f"Searching for: {title}")
             self["title"].setText(title)
             self["meta"].setText("Auto-search from EPG...")
-            
+
             # Start search in background
             threading.Thread(
                 target=self._thread_wrapper,
@@ -931,45 +1536,67 @@ class CiefpRTMain(Screen):
                 daemon=True
             ).start()
         else:
+            dlog("EPG: No EPG info found")  # NOVO - debug
             self["status"].setText("Ready - No EPG info found")
 
     def _search_epg_thread(self, query):
         """Search for EPG program"""
         try:
-            if self._closing or self._exiting:
+            # Provjeri da li screen još postoji
+            if not hasattr(self, '_closing') or self._closing:
                 return
-                
+            if not hasattr(self, '_exiting') or self._exiting:
+                return
+
             dlog(f"EPG SEARCH: {query}")
-            
-            # First try movie search
-            results = search_rt(query, search_type="movie")
-            
+
+            # Očisti naziv
+            clean_query = re.sub(r'[:;!?]', ' ', query)
+            clean_query = re.sub(r'\s*\(\d{4}\)\s*$', '', clean_query)
+            clean_query = re.sub(r'\s+', ' ', clean_query).strip()
+
+            dlog(f"EPG: Cleaned query: {clean_query}")
+
+            # Prvo probaj sa search_rt (koji koristi API pa fallback)
+            results = search_rt(clean_query, search_type="movie")
+
             if not results:
-                # Try TV search
-                results = search_rt(query, search_type="tv")
-            
+                results = search_rt(clean_query, search_type="tv")
+
             def process_results():
                 if self._closing or self._exiting:
                     return
-                    
+
+                # Sakrij help ako je prikazan
+                if self.showing_help:
+                    self["help"].hide()
+                    self.showing_help = False
+
                 if results:
-                    # Auto-select first result
                     if len(results) > 0:
                         self._load_item_details(results[0])
                         self["status"].setText(f"Found: {results[0]['name']}")
                     else:
-                        self["status"].setText(f"No results for: {query}")
+                        self["status"].setText(f"No results for: {clean_query}")
                         self._show_placeholder()
                 else:
-                    self["status"].setText(f"No results for: {query}")
+                    self["status"].setText(f"No results for: {clean_query}")
                     self._show_placeholder()
-            
-            self.ui(process_results)
+
+            # Provjeri da li ui metoda postoji
+            if hasattr(self, 'ui'):
+                self.ui(process_results)
+            else:
+                process_results()
+
         except Exception as e:
             dlog(f"EPG SEARCH error: {e}")
-            if not self._closing and not self._exiting:
-                self.ui(lambda: self["status"].setText("EPG search failed"))
-                self.ui(self._show_placeholder)
+            try:
+                if hasattr(self, 'ui'):
+                    self.ui(lambda: self["status"].setText("EPG search failed"))
+                    self.ui(self._show_placeholder)
+            except:
+                pass
 
     # --- menus ---
     def open_movies_menu(self):
@@ -1082,16 +1709,33 @@ class CiefpRTMain(Screen):
         self._hide_help()
         if self._closing or self._exiting:
             return
-        
+
         cache_size = get_cache_size()
         cache_info = f" ({cache_size:.1f}MB)" if cache_size > 0 else ""
-        
+
+        # Trenutni player - uzmi iz configa ili postavi default
+        if hasattr(config.plugins.ciefprt, 'player'):
+            player_value = config.plugins.ciefprt.player.value
+            if player_value == "movieplayer":
+                current_player = "Movie Player"
+            elif player_value == "browser":
+                current_player = "External Browser"
+            elif player_value == "download":
+                current_player = "Download & Play"
+            else:
+                current_player = "Movie Player"
+        else:
+            current_player = "Movie Player"
+
         menu = [
             (f"Clear Cache{cache_info}", "clear"),
             ("Show debug log (last 80 lines)", "showlog"),
             ("Clear debug log", "clearlog"),
             ("Auto EPG Search (current: %s)" % ("ON" if config.plugins.ciefprt.auto_epg.value else "OFF"), "auto_epg"),
             ("Items load limit (current: %s)" % config.plugins.ciefprt.max_items.value, "max_items"),
+            ("YouTube Search (current: %s)" % ("ON" if config.plugins.ciefprt.youtube_search.value else "OFF"),
+             "youtube_search"),
+            ("Select Player (current: %s)" % current_player, "select_player"),
             ("About", "about"),
         ]
         self.session.openWithCallback(self._settings_choice, ChoiceBox, title="Settings", list=menu)
@@ -1115,6 +1759,11 @@ class CiefpRTMain(Screen):
             config.plugins.ciefprt.auto_epg.save()
             status = "ON" if config.plugins.ciefprt.auto_epg.value else "OFF"
             self["status"].setText(f"Auto EPG: {status}")
+        elif key == "youtube_search":
+            config.plugins.ciefprt.youtube_search.value = not config.plugins.ciefprt.youtube_search.value
+            config.plugins.ciefprt.youtube_search.save()
+            status = "ON" if config.plugins.ciefprt.youtube_search.value else "OFF"
+            self["status"].setText(f"YouTube Search: {status}")
         elif key == "max_items":
             opts = [("50", "50"), ("100", "100"), ("150", "150"), ("200", "200"), ("300", "300")]
 
@@ -1127,19 +1776,43 @@ class CiefpRTMain(Screen):
                 self["status"].setText(f"Items limit set to: {val}")
 
             self.session.openWithCallback(_set_limit, ChoiceBox, title="Select items load limit", list=opts)
+
+        elif key == "select_player":
+            players = [
+                ("Movie Player (servicemp3)", "movieplayer"),
+                ("External Browser", "browser"),
+                ("Download & Play", "download"),
+            ]
+
+            def _set_player(sel):
+                if not sel or self._closing or self._exiting:
+                    return
+                player = sel[1]
+                # Spremi izbor u config
+                if not hasattr(config.plugins.ciefprt, 'player'):
+                    config.plugins.ciefprt.player = ConfigSelection(default="movieplayer",
+                                                                    choices=[("movieplayer", "Movie Player"),
+                                                                             ("browser", "External Browser"),
+                                                                             ("download", "Download & Play")])
+                config.plugins.ciefprt.player.value = player
+                config.plugins.ciefprt.player.save()
+                self["status"].setText(f"Player set to: {sel[0]}")
+
+            self.session.openWithCallback(_set_player, ChoiceBox, title="Select Player", list=players)
         elif key == "about":
             about_text = f"""{PLUGIN_NAME} v{PLUGIN_VERSION}
 
-Browse Rotten Tomatoes movies and TV series.
+    Browse Rotten Tomatoes movies and TV series.
 
-Features:
-• Browse popular/trending content
-• Search for movies and series
-• Auto-search from EPG
-• Cache system for faster loading
-• Placeholder images for missing posters
+    Features:
+    • Browse popular/trending content
+    • Search for movies and series
+    • Auto-search from EPG
+    • Cache system for faster loading
+    • Placeholder images for missing posters
+    • YouTube trailer search
 
-Cache: {get_cache_size():.1f}MB"""
+    Cache: {get_cache_size():.1f}MB"""
             self.session.open(MessageBox, about_text, MessageBox.TYPE_INFO, timeout=15)
 
     # --- Search functions ---
@@ -1394,7 +2067,12 @@ Cache: {get_cache_size():.1f}MB"""
     def _load_item_details(self, item):
         if self._closing or self._exiting:
             return
-            
+
+        # Sakrij help ako je prikazan
+        if self.showing_help:
+            self["help"].hide()
+            self.showing_help = False
+
         self.current_item = item
         self["title"].setText(item.get("name", ""))
         self["meta"].setText("Loading details...")
@@ -1478,7 +2156,7 @@ Cache: {get_cache_size():.1f}MB"""
             raw = get_cached_page(detail_url, ttl=900) or http_get(detail_url, timeout=8)
             set_cached_page(detail_url, raw)
             html = raw.decode("utf-8", "ignore")
-            d = parse_detail(html)
+            d = parse_detail(html, detail_url)
 
             def apply():
                 if self._closing or self._exiting:
@@ -1515,6 +2193,13 @@ Cache: {get_cache_size():.1f}MB"""
                     lines.append("Cast: %s" % cast)
                 self["cast"].setText("\n".join(lines))
 
+                # NOVO: Indikator za trejler u statusu
+                trailer_url = d.get("trailer_url", "")
+                if trailer_url:
+                    self["status"].setText("▶ Trailer available - Press OK for menu")
+                else:
+                    self["status"].setText("Press OK for menu")
+
                 # if the list item had no poster, try og:image
                 if (self.current_item and not self.current_item.get("image")) and d.get("poster_url"):
                     threading.Thread(
@@ -1538,10 +2223,15 @@ Cache: {get_cache_size():.1f}MB"""
             return
 
         d = getattr(self, "current_detail", {}) or {}
+        trailer_url = d.get("trailer_url", "")  # NOVO
 
         menu = [
             ("Show item URL", "url"),
         ]
+
+        # NOVO: Dodaj opciju za trejler
+        if trailer_url:
+            menu.append(("▶ Watch Trailer", "trailer"))
 
         if d.get("backdrop_url"):
             menu.append(("Show Backdrop", "backdrop"))
@@ -1623,7 +2313,7 @@ Cache: {get_cache_size():.1f}MB"""
 
     def _open_celebrity(self, name):
         url = BASE + "/celebrity/" + self._to_celebrity_slug(name)
-        self.session.open(CiefpRTCelebrity, url, name)
+        self.session.open(CiefpRTCelebrity, url, name),
 
     def _item_choice(self, choice):
         if not choice or self._closing or self._exiting:
@@ -1638,6 +2328,14 @@ Cache: {get_cache_size():.1f}MB"""
                 MessageBox.TYPE_INFO,
                 timeout=8
             )
+        elif action == "trailer":
+            d = getattr(self, "current_detail", {}) or {}
+            trailer_url = d.get("trailer_url", "")
+            trailer_type = d.get("trailer_type", "hls")
+            if trailer_url:
+                name = self.current_item.get("name", "Trailer") if self.current_item else "Trailer"
+                # Otvori player direktno (bez zatvaranja glavnog ekrana)
+                self.session.open(CiefpRTPlayer, trailer_url, trailer_type, name)
 
         elif action == "backdrop":
             self._show_backdrop()
@@ -1656,6 +2354,59 @@ Cache: {get_cache_size():.1f}MB"""
             self["cast"].setText("")
             self._show_placeholder()
             self["status"].setText("Ready")
+
+    def _play_trailer_direct(self):
+        """Direct play trailer when white button is pressed"""
+        if self._closing or self._exiting:
+            return
+
+        d = getattr(self, "current_detail", {}) or {}
+        trailer_url = d.get("trailer_url", "")
+
+        if trailer_url:
+            trailer_type = d.get("trailer_type", "hls")
+            name = self.current_item.get("name", "Trailer") if self.current_item else "Trailer"
+            # Otvori player direktno (bez zatvaranja glavnog ekrana)
+            self.session.open(CiefpRTPlayer, trailer_url, trailer_type, name)
+        else:
+            self.session.open(
+                MessageBox,
+                "No trailer available for this title.",
+                MessageBox.TYPE_INFO,
+                timeout=3
+            )
+
+    def _on_main_close(self):
+        """Called when main screen is closed - open player if trailer data exists"""
+        if hasattr(self, '_trailer_data') and self._trailer_data:
+            trailer_url, trailer_type, name = self._trailer_data
+            dlog(f"MAIN: Opening player for {name}")
+
+            # Otvori player direktno (radi u većini slučajeva)
+            try:
+                self.session.open(CiefpRTPlayer, trailer_url, trailer_type, name)
+            except Exception as e:
+                dlog(f"MAIN: Direct open failed: {e}")
+                # Ako direktno ne radi, probaj sa timerom
+                timer = eTimer()
+
+                def open_player():
+                    try:
+                        self.session.open(CiefpRTPlayer, trailer_url, trailer_type, name)
+                    except Exception as e2:
+                        dlog(f"MAIN: Timer open failed: {e2}")
+
+                timer.callback.append(open_player)
+                timer.start(200, True)
+
+            # Očisti podatke
+            self._trailer_data = None
+
+    def _player_closed(self):
+        """Called when player is closed"""
+        dlog("MAIN: Player closed")
+        # Ovdje možete dodati bilo kakvu akciju nakon zatvaranja playera
+
 
 def _extract_jsonld_person(html_text):
     blocks = re.findall(
@@ -1921,7 +2672,6 @@ class CiefpRTBackdrop(Screen):
         except:
             pass
 
-
 class CiefpRTCelebrity(Screen):
     skin = """
     <screen name="CiefpRTCelebrity" position="0,0" size="1920,1080" title="Celebrity">
@@ -2021,6 +2771,231 @@ class CiefpRTCelebrity(Screen):
         except:
             pass
 
+
+class CiefpRTPlayer(Screen):
+    """Screen for playing trailers using Movie Player"""
+    skin = """
+    <screen name="CiefpRTPlayer" position="center,center" size="1920,1080" title="Trailer Player">
+        <widget name="status" position="60,40" size="1800,40" font="Regular;30" transparent="1" />
+        <widget name="info" position="60,100" size="1800,60" font="Regular;34" transparent="1" foregroundColor="#00ff6e" />
+        <ePixmap position="200,200" size="1520,680" zPosition="1" backgroundColor="#80000000" />
+        <widget name="message" position="200,200" size="1520,680" font="Regular;36" transparent="1" halign="center" valign="center" foregroundColor="#ffffff" />
+
+        <!-- Kontrole -->
+        <ePixmap pixmap="buttons/red.png" position="60,1010" size="35,35" alphatest="blend" />
+        <eLabel text="Exit" position="105,1002" size="180,45" font="Regular;26" />
+        <ePixmap pixmap="buttons/green.png" position="330,1010" size="35,35" alphatest="blend" />
+        <eLabel text="Open Browser" position="375,1002" size="280,45" font="Regular;26" />
+        <ePixmap pixmap="buttons/yellow.png" position="620,1010" size="35,35" alphatest="blend" />
+        <eLabel text="Download" position="665,1002" size="220,45" font="Regular;26" />
+    </screen>
+    """
+
+    def __init__(self, session, trailer_url, trailer_type="hls", title=""):
+        Screen.__init__(self, session)
+        self.trailer_url = trailer_url
+        self.trailer_type = trailer_type
+        self.title = title
+        self._downloaded_file = None
+        self._closing = False  # NOVO
+        self._exiting = False  # NOVO
+
+        self["status"] = Label("Loading trailer...")
+        self["info"] = Label(title if title else "Video Trailer")
+        self["message"] = Label("Preparing stream...")
+
+        self["actions"] = ActionMap(
+            ["OkCancelActions", "ColorActions"],
+            {
+                "ok": self.close,
+                "cancel": self.close,
+                "red": self.close,
+                "green": self._play_external,
+                "yellow": self._download_video,  # Novo: Preuzmi video
+            },
+            -1
+        )
+
+        self._startTimer = eTimer()
+        self._startTimer.callback.append(self._auto_play)
+        self._startTimer.start(1000, True)
+        self.onClose.append(self._on_close)
+
+    def _auto_play(self):
+        """Automatically try to play the trailer"""
+        self._play_trailer()
+
+    def _play_trailer(self):
+        """Play HLS stream or YouTube trailer based on settings"""
+        try:
+            # Provjeri koji player je odabran
+            if hasattr(config.plugins.ciefprt, 'player'):
+                player_mode = config.plugins.ciefprt.player.value
+            else:
+                player_mode = "movieplayer"
+
+            dlog(f"TRAILER: Using player mode: {player_mode}")
+
+            if self.trailer_type == "hls":
+                if player_mode == "browser":
+                    self._play_external()
+                elif player_mode == "download":
+                    self._download_video()
+                else:
+                    self._play_hls_stream()
+            else:
+                if player_mode == "browser":
+                    self._play_external()
+                elif player_mode == "download":
+                    self._download_video()
+                else:
+                    self._play_youtube()
+        except Exception as e:
+            dlog(f"TRAILER playback error: {e}")
+            self._show_manual_instructions()
+
+    def _play_hls_stream(self):
+        """Play HLS stream using Movie Player"""
+        try:
+            if play_video_with_movieplayer(self.session, self.trailer_url, self.title):
+                self["status"].setText("▶ Playing trailer... (press OK to stop)")
+                self["message"].setText("")
+                return
+        except Exception as e:
+            dlog(f"HLS playback error: {e}")
+
+        # Ako direktna reprodukcija ne radi, ponudi eksterni player
+        self._show_manual_instructions()
+
+    def _play_youtube(self):
+        """Play YouTube video using yt-dlp and Movie Player"""
+        try:
+            dlog(f"YT: Attempting to play: {self.trailer_url}")
+
+            # Prvo probaj dobiti direktan stream URL preko yt-dlp
+            stream_url = play_youtube_with_ytdlp(self.trailer_url)
+
+            if stream_url:
+                dlog(f"YT: Got stream URL, trying Movie Player...")
+                # Pokušaj reproducirati sa Movie Player
+                if play_video_with_movieplayer(self.session, stream_url, self.title):
+                    self["status"].setText("▶ Playing trailer... (press OK to stop)")
+                    self["message"].setText("")
+                    dlog("YT: Playing with Movie Player")
+                    return
+
+            # Ako ne radi, pokušaj direktno sa YouTube linkom
+            if play_video_with_movieplayer(self.session, self.trailer_url, self.title):
+                self["status"].setText("▶ Playing YouTube trailer...")
+                self["message"].setText("")
+                return
+
+        except Exception as e:
+            dlog(f"YouTube playback error: {e}")
+
+        # Ako ništa ne radi, ponudi eksterni player
+        self._show_manual_instructions()
+
+    def _show_manual_instructions(self):
+        """Show manual instructions when automatic playback fails"""
+        self["status"].setText("Press GREEN for browser, YELLOW to download")
+        self["message"].setText(
+            f"Trailer URL:\n\n"
+            f"{self.trailer_url[:100]}...\n\n"
+            f"GREEN - Open in browser\n"
+            f"YELLOW - Download video\n"
+            f"OK/RED - Close"
+        )
+
+    def _play_external(self):
+        """Open trailer in external browser"""
+        try:
+            from Plugins.Extensions.DreamBrowser.plugin import DreamBrowser
+            self.session.open(DreamBrowser, self.trailer_url)
+        except:
+            self.session.open(
+                MessageBox,
+                f"Open this URL in your browser:\n\n{self.trailer_url}",
+                MessageBox.TYPE_INFO,
+                timeout=15
+            )
+
+    def _download_video(self):
+        """Download video for local playback"""
+        try:
+            import subprocess
+            import tempfile
+
+            # Kreiraj temp fajl
+            self._downloaded_file = tempfile.mktemp(suffix='.mp4')
+
+            self["status"].setText("Downloading video...")
+            self["message"].setText("Please wait...")
+
+            # Pokreni download u pozadini
+            threading.Thread(
+                target=self._download_thread,
+                daemon=True
+            ).start()
+
+        except Exception as e:
+            dlog(f"Download error: {e}")
+            self.session.open(
+                MessageBox,
+                f"Download failed: {e}",
+                MessageBox.TYPE_INFO,
+                timeout=5
+            )
+
+    def _download_thread(self):
+        """Download video in background thread"""
+        try:
+            import subprocess
+
+            cmd = ['yt-dlp', '-f', 'best[height<=720]', '-o', self._downloaded_file, self.trailer_url]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+            if result.returncode == 0 and os.path.exists(self._downloaded_file):
+                file_size = os.path.getsize(self._downloaded_file)
+                if file_size > 0:
+                    # Reproduciraj preuzeti fajl
+                    self.ui(lambda: self._play_downloaded_file())
+                    return
+
+            # Ako download ne uspije
+            self.ui(lambda: self["message"].setText("Download failed"))
+
+        except Exception as e:
+            dlog(f"Download thread error: {e}")
+            self.ui(lambda: self["message"].setText(f"Download error: {e}"))
+
+    def _play_downloaded_file(self):
+        """Play downloaded video file"""
+        try:
+            if self._downloaded_file and os.path.exists(self._downloaded_file):
+                if play_video_with_movieplayer(self.session, self._downloaded_file, self.title):
+                    self["status"].setText("▶ Playing downloaded trailer...")
+                    self["message"].setText("")
+                    return
+        except Exception as e:
+            dlog(f"Play downloaded error: {e}")
+
+        self["message"].setText("Could not play downloaded file")
+
+    def ui(self, fn):
+        """UI thread dispatcher"""
+        if self._closing or self._exiting:
+            return
+        # Koristi eTimer za UI ažuriranje
+        timer = eTimer()
+        timer.callback.append(fn)
+        timer.start(1, True)
+        self._ui_timer = timer
+
+    def _on_close(self):
+        """Called when player is closed"""
+        dlog("TRAILER: Player closed")
+        # Ovdje možete dodati bilo kakvo čišćenje
 
 # ---------- plugin entry ----------
 def main(session, **kwargs):
