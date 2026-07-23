@@ -24,7 +24,7 @@ from Plugins.Plugin import PluginDescriptor
 
 
 PLUGIN_NAME = "CiefpRottenTomatoes"
-PLUGIN_VERSION = "1.3"
+PLUGIN_VERSION = "1.4"
 BASE = "https://www.rottentomatoes.com"
 
 
@@ -1224,7 +1224,7 @@ def get_current_epg_info(session):
 # ---------- UI ----------
 class CiefpRTMain(Screen):
     skin = """
-    <screen position="center,center" size="1920,1080" title="CiefpRottenTomatoes">
+    <screen position="center,center" size="1920,1080" backgroundColor="#011a2e" >
         <widget name="status" position="60,40" size="1800,40" font="Regular;30" transparent="1" />
 
         <widget name="title" position="60,100" size="1200,55" font="Regular;44" transparent="1" foregroundColor="#00ff6e" />
@@ -1246,15 +1246,15 @@ class CiefpRTMain(Screen):
         <widget name="poster" position="1350,120" size="500,750" alphatest="blend" />
 
         <ePixmap pixmap="buttons/red.png" position="60,1010" size="35,35" alphatest="blend" />
-        <eLabel text="Exit" position="105,1002" size="180,45" font="Regular;26" />
+        <eLabel text="Exit" position="105,1002" size="180,45" font="Regular;26" backgroundColor="#011a2e" />
         <ePixmap pixmap="buttons/green.png" position="330,1010" size="35,35" alphatest="blend" />
-        <eLabel text="Movies" position="375,1002" size="220,45" font="Regular;26" />
+        <eLabel text="Movies" position="375,1002" size="220,45" font="Regular;26" backgroundColor="#011a2e" />
         <ePixmap pixmap="buttons/yellow.png" position="620,1010" size="35,35" alphatest="blend" />
-        <eLabel text="Series" position="665,1002" size="220,45" font="Regular;26" />
+        <eLabel text="Series" position="665,1002" size="220,45" font="Regular;26" backgroundColor="#011a2e" />
         <ePixmap pixmap="buttons/blue.png" position="910,1010" size="35,35" alphatest="blend" />
-        <eLabel text="Settings" position="955,1002" size="340,45" font="Regular;26" />
+        <eLabel text="Settings" position="955,1002" size="340,45" font="Regular;26" backgroundColor="#011a2e" />
         <ePixmap pixmap="buttons/key_menu.png" position="1210,1010" size="45,45" alphatest="blend" />
-        <eLabel text="▶Trailer" position="1260,1002" size="440,45" font="Regular;26" foregroundColor="#ffffff" />
+        <eLabel text="▶Trailer" position="1260,1002" size="440,45" font="Regular;26" foregroundColor="#ffffff" backgroundColor="#011a2e" />
     </screen>
     """
 
