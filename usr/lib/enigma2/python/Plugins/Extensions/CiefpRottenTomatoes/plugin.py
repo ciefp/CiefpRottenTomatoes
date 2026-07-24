@@ -1329,7 +1329,7 @@ class CiefpRTMain(Screen):
 
         dlog("HELP: shown")
         txt = (
-            "Welcome to Ciefp Rotten Tomatoes 1.3\n\n"
+            "Welcome to Ciefp Rotten Tomatoes 1.4\n\n"
             "GREEN  = Movies\n"
             "YELLOW = Series\n"
             "BLUE   = Settings\n"
